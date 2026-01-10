@@ -38,17 +38,40 @@ try:
 except Exception:
     _HAS_PLOTLY = False
 
+try:
+    from scipy.spatial.distance import cdist as _cdist
+    from scipy.special import erf as _scipy_erf
+    from scipy.stats import norm as _scipy_norm
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+try:
+    from joblib import Parallel, delayed
+    _HAS_JOBLIB = True
+except Exception:
+    _HAS_JOBLIB = False
+
 
 # ============================================================
-# Normal helpers (SciPy不要)
+# Normal helpers (SciPy推奨だがフォールバック可能)
 # ============================================================
 
 def _phi(z: np.ndarray) -> np.ndarray:
+    """標準正規分布のPDF（確率密度関数）"""
+    if _HAS_SCIPY:
+        return _scipy_norm.pdf(z)
     z = np.clip(np.asarray(z), -100, 100)
     return np.exp(-0.5 * z * z) / np.sqrt(2.0 * np.pi)
 
 def _Phi(z: np.ndarray) -> np.ndarray:
+    """標準正規分布のCDF（累積分布関数）"""
+    if _HAS_SCIPY:
+        return _scipy_norm.cdf(z)
     z = np.clip(np.asarray(z), -100, 100)
+    # erfはscipyがあれば高速、なければmath.erfのベクトル化版を使用
+    if _HAS_SCIPY:
+        return 0.5 * (1.0 + _scipy_erf(z / np.sqrt(2.0)))
     v_erf = np.vectorize(math.erf)
     return 0.5 * (1.0 + v_erf(z / np.sqrt(2.0)))
 
@@ -674,6 +697,26 @@ class RSMPlusGP_Production:
 # Validation: KFold CV + Plotly (optional)
 # ============================================================
 
+def _fit_fold(base_model: RSMPlusGP_Production, X: np.ndarray, y_true: np.ndarray,
+              tr: np.ndarray, te: np.ndarray, feature_names: List[str]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """単一のfoldを処理（並列化用ヘルパー関数）"""
+    m = RSMPlusGP_Production(
+        include_bias=base_model.include_bias,
+        gp_kernel=base_model.gp_kernel,
+        gp_alpha=base_model.gp_alpha,
+        gp_n_restarts_optimizer=base_model.gp_n_restarts_optimizer,
+        gp_optimizer=base_model.gp_optimizer,
+        random_state=base_model.random_state,
+        F_enter=base_model.F_enter,
+        F_remove=base_model.F_remove,
+        start_with_linear=base_model.start_with_linear,
+        stepwise_verbose=False,
+        model_type=base_model.model_type,
+    )
+    m.fit(X[tr], y_true[tr], feature_names=feature_names)
+    mu, sd = m.predict(X[te], return_std=True)
+    return te, mu, sd
+
 def perform_kfold_cv(
     base_model: RSMPlusGP_Production,
     X: np.ndarray,
@@ -682,7 +725,13 @@ def perform_kfold_cv(
     n_splits: int = 5,
     shuffle: bool = True,
     random_state: int = 0,
+    n_jobs: int = -1,  # -1 = 全CPUコア使用、1 = 逐次処理
 ) -> Dict[str, Any]:
+    """K-Fold CV（並列化対応版）
+
+    Args:
+        n_jobs: 並列ジョブ数。-1で全コア使用、1で逐次処理。joblibがない場合は自動的に逐次処理。
+    """
     X = np.asarray(X, dtype=float)
     y_true = np.asarray(y, dtype=float).ravel()
 
@@ -691,28 +740,26 @@ def perform_kfold_cv(
         feature_names = [f"x{i+1}" for i in range(d)]
 
     kf = KFold(n_splits=n_splits, shuffle=shuffle, random_state=random_state)
+    splits = list(kf.split(X))
 
     y_pred = np.zeros_like(y_true, dtype=float)
     y_std = np.zeros_like(y_true, dtype=float)
 
-    for tr, te in kf.split(X):
-        m = RSMPlusGP_Production(
-            include_bias=base_model.include_bias,
-            gp_kernel=base_model.gp_kernel,
-            gp_alpha=base_model.gp_alpha,
-            gp_n_restarts_optimizer=base_model.gp_n_restarts_optimizer,
-            gp_optimizer=base_model.gp_optimizer,
-            random_state=base_model.random_state,
-            F_enter=base_model.F_enter,
-            F_remove=base_model.F_remove,
-            start_with_linear=base_model.start_with_linear,
-            stepwise_verbose=False,
-            model_type=base_model.model_type,
+    # 並列化（joblibがあれば）
+    if _HAS_JOBLIB and n_jobs != 1:
+        results = Parallel(n_jobs=n_jobs)(
+            delayed(_fit_fold)(base_model, X, y_true, tr, te, feature_names)
+            for tr, te in splits
         )
-        m.fit(X[tr], y_true[tr], feature_names=feature_names)
-        mu, sd = m.predict(X[te], return_std=True)
-        y_pred[te] = mu
-        y_std[te] = sd
+        for te, mu, sd in results:
+            y_pred[te] = mu
+            y_std[te] = sd
+    else:
+        # 逐次処理（joblibなしまたはn_jobs=1）
+        for tr, te in splits:
+            te_idx, mu, sd = _fit_fold(base_model, X, y_true, tr, te, feature_names)
+            y_pred[te_idx] = mu
+            y_std[te_idx] = sd
 
     rmse = float(np.sqrt(mean_squared_error(y_true, y_pred)))
     mae = float(mean_absolute_error(y_true, y_pred))
@@ -800,6 +847,12 @@ def build_candidates(
     return X
 
 def _min_dist_to_train(Xcand: np.ndarray, Xtrain: np.ndarray) -> np.ndarray:
+    """各候補点から訓練データへの最小距離を計算（最適化版）"""
+    if _HAS_SCIPY:
+        # scipy.spatial.distance.cdist は C実装で2-5倍高速
+        d = _cdist(Xcand, Xtrain, metric='euclidean')
+        return np.min(d, axis=1)
+    # フォールバック：純粋NumPy版
     d = np.linalg.norm(Xcand[:, None, :] - Xtrain[None, :, :], axis=2)
     return np.min(d, axis=1)
 
@@ -856,11 +909,21 @@ def propose_next_EI_constrained(
 
     mask = np.ones(Xcand.shape[0], dtype=bool)
     if constraint_fn is not None:
-        mask &= np.array([bool(constraint_fn(x)) for x in Xcand], dtype=bool)
+        # ベクトル化を試みる（高速）、失敗したらループにフォールバック
+        try:
+            mask &= np.asarray(constraint_fn(Xcand), dtype=bool)
+        except (TypeError, ValueError):
+            # 制約関数がベクトル化非対応の場合はループ
+            mask &= np.array([bool(constraint_fn(x)) for x in Xcand], dtype=bool)
 
     costs = None
     if cost_fn is not None:
-        costs = np.array([float(cost_fn(x)) for x in Xcand], dtype=float)
+        # コスト関数もベクトル化を試みる
+        try:
+            costs = np.asarray(cost_fn(Xcand), dtype=float)
+        except (TypeError, ValueError):
+            # ベクトル化非対応の場合はループ
+            costs = np.array([float(cost_fn(x)) for x in Xcand], dtype=float)
         if cost_budget is not None:
             mask &= (costs <= cost_budget)
 
@@ -869,9 +932,7 @@ def propose_next_EI_constrained(
         raise RuntimeError("No feasible candidates under constraints/budget.")
     cf = costs[mask] if costs is not None else None
 
-    mu = model.predict(Xf, return_std=False)
-
-    # std for EI (必ず predict_interval_two_types 経由＝自己診断込み)
+    # 最適化: predict を2回呼ばず、predict_interval_two_types で mu と std を一度に取得
     if std_mode == "gp_latent":
         info = model.predict_interval_two_types(Xf, level=0.95, include_rsm_param_uncertainty=False)
         std = info["components"]["gp_latent_std"]
@@ -882,6 +943,9 @@ def propose_next_EI_constrained(
         std = info["posterior"]["std"] if std_mode == "posterior" else info["predictive"]["std"]
     else:
         raise ValueError("std_mode must be 'gp_latent', 'posterior', or 'predictive'")
+
+    # meanは上記のinfoから取得（重複呼び出しを削減）
+    mu = info["mean"]
 
     if best_mode == "observed":
         best = float(np.min(model._y_train)) if objective == "min" else float(np.max(model._y_train))
