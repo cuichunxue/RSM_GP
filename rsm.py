@@ -808,6 +808,42 @@ class RSMPlusGP_Production:
         else:
             info['kernel_status'] = "不明"
 
+        # 高次項検知（GP補正の空間的パターン分析）
+        gp_correction = y_full - y_rsm_only
+        gp_correction_magnitude = np.abs(gp_correction)
+        avg_correction = np.mean(gp_correction_magnitude)
+        max_correction = np.max(gp_correction_magnitude)
+        correction_std = np.std(gp_correction_magnitude)
+
+        # 補正の相対的な大きさ
+        y_range = np.max(y_test_true) - np.min(y_test_true)
+        relative_correction = avg_correction / y_range * 100 if y_range > 1e-10 else 0.0
+
+        # 補正の不均一性（局所的な非線形性の指標）
+        correction_cv = correction_std / avg_correction if avg_correction > 1e-10 else 0.0
+
+        info['gp_correction_avg'] = avg_correction
+        info['gp_correction_max'] = max_correction
+        info['gp_correction_relative'] = relative_correction
+        info['gp_correction_cv'] = correction_cv
+
+        # 高次項の存在可能性を判定
+        higher_order_detected = False
+        higher_order_strength = "なし"
+
+        if info['gp_contribution'] > 30 or info['improvement'] > 15:
+            higher_order_detected = True
+            higher_order_strength = "強い"
+        elif info['gp_contribution'] > 15 or info['improvement'] > 8:
+            higher_order_detected = True
+            higher_order_strength = "中程度"
+        elif info['gp_contribution'] > 5 or info['improvement'] > 3:
+            higher_order_detected = True
+            higher_order_strength = "弱い"
+
+        info['higher_order_detected'] = higher_order_detected
+        info['higher_order_strength'] = higher_order_strength
+
         # 推奨事項の生成
         recommendations = []
 
@@ -824,10 +860,32 @@ class RSMPlusGP_Production:
             recommendations.append("⚠ モデルの精度が低いです")
             recommendations.append("  データ数を大幅に増やしてください")
 
-        if info['improvement'] < 5:
-            recommendations.append(f"  GPの改善が小さいです（{info['improvement']:.1f}%）")
-            if info['n_train'] < 100:
-                recommendations.append("  → データを増やすとGPが高次項を捕捉（n≥100推奨）")
+        # 高次項検知の推奨事項
+        if higher_order_detected:
+            if higher_order_strength == "強い":
+                recommendations.append(f"⚠ 高次項（3次以上）の存在が強く示唆されます")
+                recommendations.append(f"  GP寄与度: {info['gp_contribution']:.1f}%（RSMで捉えられない非線形性）")
+                recommendations.append(f"  GP改善率: {info['improvement']:.1f}%（高次項の重要性が高い）")
+                if info['n_train'] < 100:
+                    recommendations.append(f"  → データを増やすとGPが高次項をより正確に捕捉（n≥100推奨）")
+                else:
+                    recommendations.append(f"  → 現在のデータ量（n={info['n_train']}）で高次項を良好に捕捉")
+                if relative_correction > 10:
+                    recommendations.append(f"  → GP補正の大きさ: 応答範囲の{relative_correction:.1f}%")
+            elif higher_order_strength == "中程度":
+                recommendations.append(f"○ 高次項（3次以上）の存在が示唆されます")
+                recommendations.append(f"  GP寄与度: {info['gp_contribution']:.1f}%、改善率: {info['improvement']:.1f}%")
+                if info['n_train'] < 100:
+                    recommendations.append(f"  → データを増やすとより正確に高次項を捕捉（n≥100推奨）")
+            else:  # 弱い
+                recommendations.append(f"○ 軽微な高次項の可能性があります")
+                recommendations.append(f"  GP寄与度: {info['gp_contribution']:.1f}%（小さい）")
+                if info['n_train'] < 50:
+                    recommendations.append(f"  → データを増やすと高次項検知の信頼性向上")
+        else:
+            if info['improvement'] < 3 and info['n_train'] < 100:
+                recommendations.append(f"  GPの改善が小さいです（{info['improvement']:.1f}%）")
+                recommendations.append("  → データを増やすとGPが高次項を捕捉可能（n≥100推奨）")
 
         if info['kernel_status'] != "適切 ✓" and info['kernel_status'] != "不明":
             recommendations.append(f"⚠ カーネルパラメータ: {info['kernel_status']}")
@@ -874,6 +932,27 @@ class RSMPlusGP_Production:
                 print(f"  評価: {info['kernel_status']}")
             else:
                 print("  カーネルパラメータ情報なし")
+
+            print("\n【高次項検知】")
+            if info['higher_order_detected']:
+                strength_emoji = {"強い": "⚠", "中程度": "○", "弱い": "△"}
+                emoji = strength_emoji.get(info['higher_order_strength'], "○")
+                print(f"  {emoji} 高次項（3次以上）の存在: {info['higher_order_strength']}")
+                print(f"  GP補正（平均）: {info['gp_correction_avg']:.4f}")
+                print(f"  GP補正（最大）: {info['gp_correction_max']:.4f}")
+                print(f"  補正の相対値: 応答範囲の{info['gp_correction_relative']:.1f}%")
+                if info['higher_order_strength'] == "強い":
+                    print("  → RSMでは捉えられない重要な非線形性が存在します")
+                    print("  → GPがこの高次項を効果的に補正しています")
+                elif info['higher_order_strength'] == "中程度":
+                    print("  → 軽微〜中程度の高次項が存在する可能性があります")
+                else:
+                    print("  → 軽微な非線形性のみ、ほぼRSMで説明可能")
+            else:
+                print("  ✓ 高次項の存在は検出されませんでした")
+                print("  → RSMの二次多項式で十分に説明可能")
+                if info['n_train'] < 100:
+                    print("  → データを増やすと潜在的な高次項を検知可能（n≥100推奨）")
 
             print("\n【推奨事項】")
             for rec in recommendations:
