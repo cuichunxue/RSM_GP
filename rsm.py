@@ -917,11 +917,16 @@ def perform_kfold_cv(
     shuffle: bool = True,
     random_state: int = 0,
     n_jobs: int = -1,  # -1 = 全CPUコア使用、1 = 逐次処理
+    auto_switch: bool = True,  # データサイズに応じて自動切替
+    auto_threshold: int = 100,  # 自動切替の閾値
 ) -> Dict[str, Any]:
-    """K-Fold CV（並列化対応版）
+    """K-Fold CV（並列化対応版 + 自動切替）
 
     Args:
         n_jobs: 並列ジョブ数。-1で全コア使用、1で逐次処理。joblibがない場合は自動的に逐次処理。
+        auto_switch: Trueの場合、データサイズに応じて並列化を自動切替。
+                     n < auto_threshold で逐次処理、n >= auto_threshold で並列処理。
+        auto_threshold: 自動切替の閾値（デフォルト: 100）
     """
     X = np.asarray(X, dtype=float)
     y_true = np.asarray(y, dtype=float).ravel()
@@ -936,9 +941,16 @@ def perform_kfold_cv(
     y_pred = np.zeros_like(y_true, dtype=float)
     y_std = np.zeros_like(y_true, dtype=float)
 
+    # 自動切替ロジック
+    n_samples = X.shape[0]
+    if auto_switch and n_samples < auto_threshold:
+        actual_n_jobs = 1  # 小規模データは逐次処理（オーバーヘッド回避）
+    else:
+        actual_n_jobs = n_jobs
+
     # 並列化（joblibがあれば）
-    if _HAS_JOBLIB and n_jobs != 1:
-        results = Parallel(n_jobs=n_jobs)(
+    if _HAS_JOBLIB and actual_n_jobs != 1:
+        results = Parallel(n_jobs=actual_n_jobs)(
             delayed(_fit_fold)(base_model, X, y_true, tr, te, feature_names)
             for tr, te in splits
         )
