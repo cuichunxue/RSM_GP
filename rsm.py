@@ -692,6 +692,197 @@ class RSMPlusGP_Production:
             },
         }
 
+    def diagnose(self, X_test: Optional[np.ndarray] = None, y_test_true: Optional[np.ndarray] = None,
+                 display: bool = True) -> Dict[str, Any]:
+        """
+        モデル診断ツール：RSMとGPの寄与度、性能指標、推奨事項を提供
+
+        Parameters
+        ----------
+        X_test : array-like, shape (n_samples, n_features), optional
+            テストデータの入力。Noneの場合は訓練データを使用
+        y_test_true : array-like, shape (n_samples,), optional
+            テストデータの真値。Noneの場合は訓練データを使用
+        display : bool, default=True
+            診断レポートを表示するかどうか
+
+        Returns
+        -------
+        info : dict
+            診断情報を含む辞書
+            - n_train: 訓練データ数
+            - n_features: 特徴量数
+            - n_selected_terms: 選択された項数
+            - n_total_terms: 全候補項数
+            - r2: RSM+GPのR²スコア
+            - rmse: RMSE
+            - mae: MAE
+            - rsm_only_r2: RSMのみのR²スコア
+            - improvement: GP改善率 (%)
+            - rsm_contribution: RSM寄与度 (%)
+            - gp_contribution: GP寄与度 (%)
+            - length_scale: カーネルのlength_scale
+            - constant_value: カーネルの定数値
+            - noise_level: ノイズレベル
+            - kernel_status: カーネルパラメータの評価
+            - recommendations: 推奨事項のリスト
+        """
+        self._check_fitted()
+
+        # テストデータの設定
+        if X_test is None:
+            X_test = self._X_train
+        if y_test_true is None:
+            y_test_true = self._y_train
+
+        X_test = np.asarray(X_test, dtype=float)
+        y_test_true = np.asarray(y_test_true, dtype=float).ravel()
+
+        # 基本統計
+        info = {}
+        info['n_train'] = self._X_train.shape[0]
+        info['n_features'] = self._X_train.shape[1]
+        info['n_selected_terms'] = len(self._rsm_selected_cols)
+        info['n_total_terms'] = len(self.poly.powers_)
+
+        # RSMのみの予測
+        Z_test = self.x_scaler.transform(X_test)
+        Zpoly_test = self.poly.transform(Z_test)[:, self._rsm_selected_cols]
+        t_rsm = self.lin.predict(Zpoly_test)
+        y_rsm_only = self.y_scaler.inverse_transform(t_rsm.reshape(-1, 1)).ravel()
+
+        # RSM+GPの予測
+        y_full = self.predict(X_test, return_std=False)
+
+        # 寄与度計算
+        rsm_var = np.var(y_rsm_only - np.mean(y_test_true))
+        full_var = np.var(y_full - np.mean(y_test_true))
+        gp_correction_var = np.var(y_full - y_rsm_only)
+
+        total_var = rsm_var + gp_correction_var
+        if total_var > 1e-12:
+            info['rsm_contribution'] = rsm_var / total_var * 100
+            info['gp_contribution'] = gp_correction_var / total_var * 100
+        else:
+            info['rsm_contribution'] = 100.0
+            info['gp_contribution'] = 0.0
+
+        # 精度指標
+        try:
+            from sklearn.metrics import r2_score
+            info['r2'] = r2_score(y_test_true, y_full)
+            info['rsm_only_r2'] = r2_score(y_test_true, y_rsm_only)
+        except ImportError:
+            ss_tot = np.sum((y_test_true - np.mean(y_test_true))**2)
+            ss_res = np.sum((y_test_true - y_full)**2)
+            info['r2'] = 1 - ss_res / ss_tot if ss_tot > 0 else 0.0
+            ss_res_rsm = np.sum((y_test_true - y_rsm_only)**2)
+            info['rsm_only_r2'] = 1 - ss_res_rsm / ss_tot if ss_tot > 0 else 0.0
+
+        info['rmse'] = np.sqrt(np.mean((y_test_true - y_full)**2))
+        info['mae'] = np.mean(np.abs(y_test_true - y_full))
+        info['improvement'] = (info['r2'] - info['rsm_only_r2']) * 100
+
+        # カーネルパラメータ
+        kernel_params = self.gp.kernel_
+        try:
+            # C * RBF + WhiteKernel の形式を想定
+            info['length_scale'] = kernel_params.k1.k2.length_scale
+            info['constant_value'] = kernel_params.k1.k1.constant_value
+            info['noise_level'] = kernel_params.k2.noise_level
+        except AttributeError:
+            # カーネル構造が異なる場合
+            info['length_scale'] = None
+            info['constant_value'] = None
+            info['noise_level'] = None
+
+        # カーネルパラメータの評価
+        if info['length_scale'] is not None:
+            ls = float(np.mean(info['length_scale'])) if hasattr(info['length_scale'], '__iter__') else float(info['length_scale'])
+            if ls < 0.05:
+                info['kernel_status'] = "短すぎ（過学習の可能性）"
+            elif ls > 10.0:
+                info['kernel_status'] = "長すぎ（過平滑化の可能性）"
+            else:
+                info['kernel_status'] = "適切 ✓"
+        else:
+            info['kernel_status'] = "不明"
+
+        # 推奨事項の生成
+        recommendations = []
+
+        if info['r2'] > 0.99:
+            recommendations.append("✓ モデルは非常に良好に機能しています")
+        elif info['r2'] > 0.95:
+            recommendations.append("✓ モデルは良好に機能しています")
+            if info['n_train'] < 100:
+                recommendations.append("  さらなる精度向上にはデータ追加推奨（n→100-150）")
+        elif info['r2'] > 0.90:
+            recommendations.append("⚠ モデルの精度は実用レベルですが改善余地があります")
+            recommendations.append(f"  データ数を増やすことを推奨（現在n={info['n_train']}）")
+        else:
+            recommendations.append("⚠ モデルの精度が低いです")
+            recommendations.append("  データ数を大幅に増やしてください")
+
+        if info['improvement'] < 5:
+            recommendations.append(f"  GPの改善が小さいです（{info['improvement']:.1f}%）")
+            if info['n_train'] < 100:
+                recommendations.append("  → データを増やすとGPが高次項を捕捉（n≥100推奨）")
+
+        if info['kernel_status'] != "適切 ✓" and info['kernel_status'] != "不明":
+            recommendations.append(f"⚠ カーネルパラメータ: {info['kernel_status']}")
+
+        info['recommendations'] = recommendations
+
+        # レポート表示
+        if display:
+            print("=" * 80)
+            print("モデル診断レポート")
+            print("=" * 80)
+
+            print("\n【基本統計】")
+            print(f"  訓練データ: n={info['n_train']}, d={info['n_features']}")
+            print(f"  選択項数: {info['n_selected_terms']}/{info['n_total_terms']}")
+
+            print("\n【予測性能】")
+            print(f"  R²:   {info['r2']:.4f}")
+            print(f"  RMSE: {info['rmse']:.4f}")
+            print(f"  MAE:  {info['mae']:.4f}")
+
+            print("\n【RSM vs GP 寄与度】")
+            print(f"  RSM寄与: {info['rsm_contribution']:.1f}% (主に線形・二次構造)")
+            print(f"  GP寄与:  {info['gp_contribution']:.1f}% (残差・高次項補正)")
+            print(f"  RSMのみのR²: {info['rsm_only_r2']:.4f}")
+            print(f"  GP改善:      {info['improvement']:.2f}%")
+
+            if info['rsm_contribution'] > 80:
+                print("  → RSM主導型（二次多項式で十分説明）✓")
+            elif info['gp_contribution'] > 50:
+                print("  → GP主導型（高次・非線形性が支配的）")
+            else:
+                print("  → バランス良好 ✓")
+
+            print("\n【カーネルパラメータ】")
+            if info['length_scale'] is not None:
+                ls = info['length_scale']
+                if hasattr(ls, '__iter__'):
+                    print(f"  length_scale:   {ls}")
+                else:
+                    print(f"  length_scale:   {ls:.4f}")
+                print(f"  constant_value: {info['constant_value']:.4f}")
+                print(f"  noise_level:    {info['noise_level']:.4f}")
+                print(f"  評価: {info['kernel_status']}")
+            else:
+                print("  カーネルパラメータ情報なし")
+
+            print("\n【推奨事項】")
+            for rec in recommendations:
+                print(f"  {rec}")
+
+            print("\n" + "=" * 80)
+
+        return info
+
 
 # ============================================================
 # Validation: KFold CV + Plotly (optional)
