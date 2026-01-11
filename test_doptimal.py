@@ -188,10 +188,10 @@ for name, coef in importance_random[1:6]:  # Top5
 # ==========================================
 # テスト3: 中心複合計画（CCD）風データ
 # ==========================================
-print("\n【テスト3】中心複合計画風データ (n=27, d=3)")
+print("\n【テスト3】中心複合計画風データ (n=16, d=3)")
 print("-" * 80)
 
-def generate_ccd_design(d):
+def generate_ccd_design(d, n_center=2):
     """中心複合計画（Central Composite Design）の生成"""
     points = []
 
@@ -213,19 +213,19 @@ def generate_ccd_design(d):
         point_minus[j] = -alpha
         points.append(point_minus)
 
-    # 3. 中心点（center points）: 複数点
-    for _ in range(3):
+    # 3. 中心点（center points）: n_center点
+    for _ in range(n_center):
         points.append([0] * d)
 
     return np.array(points)
 
-X_ccd = generate_ccd_design(d)
+X_ccd = generate_ccd_design(d, n_center=2)  # 8因子点 + 6軸点 + 2中心点 = 16点
 # スケーリング: [-sqrt(3), sqrt(3)] -> [-1, 1]
 alpha = np.sqrt(d)
 X_ccd = X_ccd / alpha
 y_ccd = true_function(X_ccd) + rng.normal(0, noise_std, size=X_ccd.shape[0])
 
-print(f"訓練データ数: {X_ccd.shape[0]}")
+print(f"訓練データ数: {X_ccd.shape[0]} (因子8 + 軸6 + 中心2)")
 print(f"訓練データ範囲:")
 for i in range(d):
     print(f"  x{i+1}: [{X_ccd[:, i].min():.3f}, {X_ccd[:, i].max():.3f}]")
