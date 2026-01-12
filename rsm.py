@@ -453,6 +453,9 @@ class RSMPlusGP_Production:
         stepwise_verbose: bool = False,
         # model type
         model_type: str = "quadratic",  # "interaction" | "quadratic"
+        # ARD kernel for curse of dimensionality
+        use_ard: bool = False,
+        auto_ard_threshold: int = 5,
     ):
         self.include_bias = include_bias
         self.gp_alpha = gp_alpha
@@ -469,12 +472,14 @@ class RSMPlusGP_Production:
             raise ValueError("model_type must be 'interaction' or 'quadratic'")
         self.model_type = model_type
 
+        self.use_ard = use_ard
+        self.auto_ard_threshold = auto_ard_threshold
+
         if gp_kernel is None:
-            gp_kernel = (
-                C(1.0, (1e-3, 1e3)) * RBF(1.0, (1e-2, 1e2))
-                + WhiteKernel(1e-3, (1e-6, 1e0))
-            )
+            # Default kernel will be set in fit() based on ARD settings
+            gp_kernel = "auto"
         self.gp_kernel = gp_kernel
+        self._ard_enabled = False  # Track if ARD is actually used
 
         self.x_scaler = StandardScaler()
         self.y_scaler = StandardScaler()
@@ -551,7 +556,28 @@ class RSMPlusGP_Production:
         self._rsm_s2_ = rss / df
         self._rsm_XtX_inv_ = _safe_pinv(self._Phi_train_.T @ self._Phi_train_)
 
-        kernel_instance = sk_clone(self.gp_kernel)
+        # Build GP kernel with ARD if enabled
+        kernel_to_use = self.gp_kernel
+        self._ard_enabled = False
+
+        if kernel_to_use == "auto":
+            # Determine whether to use ARD based on settings and dimensionality
+            if self.use_ard or (d >= self.auto_ard_threshold):
+                # ARD kernel: each dimension has independent length_scale
+                kernel_to_use = (
+                    C(1.0, (1e-3, 1e3)) *
+                    RBF(length_scale=[1.0]*d, length_scale_bounds=(0.1, 10.0)) +
+                    WhiteKernel(1e-3, (1e-6, 1e0))
+                )
+                self._ard_enabled = True
+            else:
+                # Standard isotropic kernel
+                kernel_to_use = (
+                    C(1.0, (1e-3, 1e3)) * RBF(1.0, (1e-2, 1e2))
+                    + WhiteKernel(1e-3, (1e-6, 1e0))
+                )
+
+        kernel_instance = sk_clone(kernel_to_use)
         self.gp = GaussianProcessRegressor(
             kernel=kernel_instance,
             alpha=self.gp_alpha,
@@ -881,6 +907,27 @@ class RSMPlusGP_Production:
             info['constant_value'] = None
             info['noise_level'] = None
 
+        # ARD情報
+        info['ard_enabled'] = self._ard_enabled
+        if self._ard_enabled and info['length_scale'] is not None:
+            ls_array = np.asarray(info['length_scale'])
+            if ls_array.ndim > 0 and len(ls_array) > 1:
+                info['ard_length_scales'] = ls_array
+                # 各次元の重要度（length_scaleの逆数）
+                info['ard_importance'] = 1.0 / ls_array
+                # 最も重要な次元を特定
+                top_k = min(3, len(ls_array))
+                top_dims = np.argsort(ls_array)[:top_k]  # 小さい順
+                info['ard_top_dimensions'] = [(i, ls_array[i]) for i in top_dims]
+            else:
+                info['ard_length_scales'] = None
+                info['ard_importance'] = None
+                info['ard_top_dimensions'] = None
+        else:
+            info['ard_length_scales'] = None
+            info['ard_importance'] = None
+            info['ard_top_dimensions'] = None
+
         # カーネルパラメータの評価
         if info['length_scale'] is not None:
             ls = float(np.mean(info['length_scale'])) if hasattr(info['length_scale'], '__iter__') else float(info['length_scale'])
@@ -1009,14 +1056,38 @@ class RSMPlusGP_Production:
             if info['length_scale'] is not None:
                 ls = info['length_scale']
                 if hasattr(ls, '__iter__'):
-                    print(f"  length_scale:   {ls}")
+                    if info['ard_enabled']:
+                        print(f"  カーネル: ARD (Automatic Relevance Determination)")
+                        print(f"  length_scale: [配列] (各次元に独立)")
+                    else:
+                        print(f"  カーネル: 標準 (等方性)")
+                        print(f"  length_scale:   {ls}")
                 else:
+                    print(f"  カーネル: 標準 (等方性)")
                     print(f"  length_scale:   {ls:.4f}")
                 print(f"  constant_value: {info['constant_value']:.4f}")
                 print(f"  noise_level:    {info['noise_level']:.4f}")
                 print(f"  評価: {info['kernel_status']}")
             else:
                 print("  カーネルパラメータ情報なし")
+
+            # ARD詳細情報
+            if info['ard_enabled'] and info['ard_length_scales'] is not None:
+                print("\n【ARD: 次元別の重要度】")
+                print("  各次元のlength_scale（小さいほど重要）:")
+                for i, ls in enumerate(info['ard_length_scales']):
+                    importance = info['ard_importance'][i]
+                    bar_len = int(min(importance * 10, 50))
+                    bar = "█" * bar_len
+                    feature_name = self._feature_names[i] if i < len(self._feature_names) else f"x{i+1}"
+                    print(f"    {feature_name:>6}: {ls:6.3f}  {bar}")
+
+                if info['ard_top_dimensions']:
+                    print(f"\n  最重要次元（Top {len(info['ard_top_dimensions'])}）:")
+                    for dim_idx, ls_val in info['ard_top_dimensions']:
+                        feature_name = self._feature_names[dim_idx] if dim_idx < len(self._feature_names) else f"x{dim_idx+1}"
+                        print(f"    {feature_name} (length_scale={ls_val:.3f})")
+                    print("  → これらの次元が非線形性に最も寄与")
 
             print("\n【高次項検知】")
             if info['higher_order_detected']:
@@ -1067,6 +1138,8 @@ def _fit_fold(base_model: RSMPlusGP_Production, X: np.ndarray, y_true: np.ndarra
         start_with_linear=base_model.start_with_linear,
         stepwise_verbose=False,
         model_type=base_model.model_type,
+        use_ard=base_model.use_ard,
+        auto_ard_threshold=base_model.auto_ard_threshold,
     )
     m.fit(X[tr], y_true[tr], feature_names=feature_names)
     mu, sd = m.predict(X[te], return_std=True)
